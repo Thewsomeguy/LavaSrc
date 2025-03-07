@@ -59,7 +59,7 @@ public class LavaSrcPlugin implements AudioPlayerManagerConfiguration {
 		}
 		if (this.sourcesConfig.isDeezer()) {
 			log.info("Registering Deezer audio source manager...");
-			manager.registerSourceManager(new DeezerAudioSourceManager(this.deezerConfig.getMasterDecryptionKey()));
+			manager.registerSourceManager(new DeezerAudioSourceManager(this.deezerConfig.getMasterDecryptionKey(), this.deezerConfig.getArl(), this.deezerConfig.getFormats()));
 		}
 		if (this.sourcesConfig.isYandexMusic()) {
 			log.info("Registering Yandex Music audio source manager...");

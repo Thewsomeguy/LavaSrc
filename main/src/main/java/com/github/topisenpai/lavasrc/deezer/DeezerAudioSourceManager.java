@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigurable {
 
@@ -44,15 +45,39 @@ public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigu
 	private static final Logger log = LoggerFactory.getLogger(DeezerAudioSourceManager.class);
 
 	private final String masterDecryptionKey;
+	private final String arl;
+	private final DeezerAudioTrack.TrackFormat[] formats;
 
 	private final HttpInterfaceManager httpInterfaceManager;
 
 	public DeezerAudioSourceManager(String masterDecryptionKey) {
+		this(masterDecryptionKey, null);
+	}
+
+	public DeezerAudioSourceManager(String masterDecryptionKey, String arl) {
+		this(masterDecryptionKey, arl, null);
+	}
+
+	public DeezerAudioSourceManager(String masterDecryptionKey, String arl, DeezerAudioTrack.TrackFormat[] formats) {
 		if (masterDecryptionKey == null || masterDecryptionKey.isEmpty()) {
 			throw new IllegalArgumentException("Deezer master key must be set");
 		}
+
 		this.masterDecryptionKey = masterDecryptionKey;
-		this.httpInterfaceManager = HttpClientTools.createDefaultThreadLocalManager();
+		this.arl = arl != null && arl.isEmpty() ? null : arl;
+		this.formats = formats != null && formats.length > 0 ? formats : DeezerAudioTrack.TrackFormat.DEFAULT_FORMATS;
+		this.httpInterfaceManager = HttpClientTools.createCookielessThreadLocalManager();
+	}
+
+	static void checkResponse(JsonBrowser json, String message) throws IllegalStateException {
+		if (json == null) {
+			throw new IllegalStateException(message + "No response");
+		}
+		var errors = json.get("data").index(0).get("errors").values();
+		if (!errors.isEmpty()) {
+			var errorsStr = errors.stream().map(error -> error.get("code").text() + ": " + error.get("message").text()).collect(Collectors.joining(", "));
+			throw new IllegalStateException(message + errorsStr);
+		}
 	}
 
 	@Override
@@ -243,6 +268,14 @@ public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigu
 
 	public String getMasterDecryptionKey() {
 		return this.masterDecryptionKey;
+	}
+
+	public String getArl() {
+		return this.arl;
+	}
+
+	public DeezerAudioTrack.TrackFormat[] getFormats() {
+		return this.formats;
 	}
 
 	public HttpInterface getHttpInterface() {
