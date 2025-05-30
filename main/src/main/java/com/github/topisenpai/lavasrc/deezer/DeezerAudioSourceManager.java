@@ -16,6 +16,8 @@ import com.sedmelluq.discord.lavaplayer.track.AudioTrackInfo;
 import com.sedmelluq.discord.lavaplayer.track.BasicAudioPlaylist;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,12 +33,18 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 
 public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigurable {
 
 	public static final Pattern URL_PATTERN = Pattern.compile("(https?://)?(www\\.)?deezer\\.com/(?<countrycode>[a-zA-Z]{2}/)?(?<type>track|album|playlist|artist)/(?<identifier>[0-9]+)");
 	public static final String SEARCH_PREFIX = "dzsearch:";
 	public static final String ISRC_PREFIX = "dzisrc:";
+	public static final String RECOMMENDATIONS_PREFIX = "dzrec:";
+	public static final String RECOMMENDATIONS_ARTIST_PREFIX = "artist=";
+	public static final String RECOMMENDATIONS_TRACK_PREFIX = "track=";
+
 	public static final String SHARE_URL = "https://deezer.page.link/";
 	public static final String PUBLIC_API_BASE = "https://api.deezer.com/2.0";
 	public static final String PRIVATE_API_BASE = "https://www.deezer.com/ajax/gw-light.php";
@@ -49,6 +57,7 @@ public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigu
 	private final DeezerAudioTrack.TrackFormat[] formats;
 
 	private final HttpInterfaceManager httpInterfaceManager;
+	private Tokens tokens;
 
 	public DeezerAudioSourceManager(String masterDecryptionKey) {
 		this(masterDecryptionKey, null);
@@ -80,6 +89,33 @@ public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigu
 		}
 	}
 
+	private void refreshSession() throws IOException {
+		var getSessionID = new HttpPost(DeezerAudioSourceManager.PRIVATE_API_BASE + "?method=deezer.ping&input=3&api_version=1.0&api_token=");
+		var json = HttpClientTools.fetchResponseAsJson(this.getHttpInterface(), getSessionID);
+
+		checkResponse(json, "Failed to get session ID: ");
+		var sessionID = json.get("results").get("SESSION").text();
+
+		var getUserToken = new HttpPost(DeezerAudioSourceManager.PRIVATE_API_BASE + "?method=deezer.getUserData&input=3&api_version=1.0&api_token=");
+		getUserToken.setHeader("Cookie", "sid=" + sessionID);
+		json = HttpClientTools.fetchResponseAsJson(this.getHttpInterface(), getUserToken);
+
+		checkResponse(json, "Failed to get user token: ");
+		this.tokens = new Tokens(
+				sessionID,
+				json.get("results").get("checkForm").text(),
+				json.get("results").get("USER").get("OPTIONS").get("license_token").text(),
+				Instant.now().plus(3600, ChronoUnit.SECONDS)
+		);
+	}
+
+	public Tokens getTokens() throws IOException {
+		if (this.tokens == null || Instant.now().isAfter(this.tokens.expireAt)) {
+			this.refreshSession();
+		}
+		return this.tokens;
+	}
+
 	@Override
 	public String getSourceName() {
 		return "deezer";
@@ -94,6 +130,10 @@ public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigu
 
 			if (reference.identifier.startsWith(ISRC_PREFIX)) {
 				return this.getTrackByISRC(reference.identifier.substring(ISRC_PREFIX.length()));
+			}
+
+			if (reference.identifier.startsWith(RECOMMENDATIONS_PREFIX)) {
+				return this.getRecommendations(reference.identifier.substring(RECOMMENDATIONS_PREFIX.length()), false);
 			}
 
 			// If the identifier is a share URL, we need to follow the redirect to find out the real url behind it
@@ -176,12 +216,64 @@ public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigu
 		);
 	}
 
+	private AudioTrack parseRecommendationTrack(JsonBrowser json, boolean preview) {
+		var id = json.get("SNG_ID").text();
+		String previewUrl = null;
+		if (!json.get("MEDIA").values().isEmpty()) {
+			previewUrl = json.get("MEDIA").values().get(0).get("HREF").text();
+		}
+		return new DeezerAudioTrack(new AudioTrackInfo(
+				json.get("SNG_TITLE").text(),
+				json.get("ART_NAME").text(),
+				json.get("DURATION").as(Long.class) * 1000,
+				id,
+				false,
+				"https://deezer.com/track/" + id),
+				json.get("isrc").text(),
+				json.get("album").get("cover_xl").text(),
+				this
+		);
+	}
+
 	private AudioItem getTrackByISRC(String isrc) throws IOException {
 		var json = this.getJson(PUBLIC_API_BASE + "/track/isrc:" + isrc);
 		if (json == null || json.get("id").isNull()) {
 			return AudioReference.NO_TRACK;
 		}
 		return this.parseTrack(json);
+	}
+
+	private AudioItem getRecommendations(String query, boolean preview) throws IOException {
+		var tokens = this.getTokens();
+
+		String method;
+		String payload;
+		if (query.startsWith(RECOMMENDATIONS_ARTIST_PREFIX)) {
+			method = "song.getSmartRadio";
+			payload = String.format("{\"art_id\": %s}", query.substring(RECOMMENDATIONS_ARTIST_PREFIX.length()));
+		} else {
+			method = "song.getSearchTrackMix";
+			payload = String.format("{\"sng_id\": %s, \"start_with_input_track\": \"true\"}", query.startsWith(RECOMMENDATIONS_TRACK_PREFIX) ? query.substring(RECOMMENDATIONS_TRACK_PREFIX.length()) : query);
+		}
+
+		var request = new HttpPost(DeezerAudioSourceManager.PRIVATE_API_BASE + String.format("?method=%s&input=3&api_version=1.0&api_token=%s", method, tokens.api));
+		request.setHeader("Cookie", "sid=" + tokens.sessionId);
+		request.setHeader("Content-Type", "application/json");
+		request.setEntity(new StringEntity(payload, StandardCharsets.UTF_8));
+
+		var result = HttpClientTools.fetchResponseAsJson(this.getHttpInterface(), request);
+		checkResponse(result, "Failed to get recommendations");
+
+		if (result.get("results").get("data").values().isEmpty()) {
+			return AudioReference.NO_TRACK;
+		}
+		var tracks = result.get("results").get("data")
+				.values()
+				.stream()
+				.map(value -> this.parseRecommendationTrack(value, preview))
+				.collect(Collectors.toList());
+
+		return new DeezerAudioPlaylist("Deezer Recommendations", tracks);
 	}
 
 	private AudioItem getSearch(String query) throws IOException {
@@ -282,4 +374,17 @@ public class DeezerAudioSourceManager implements AudioSourceManager, HttpConfigu
 		return this.httpInterfaceManager.getInterface();
 	}
 
+	public static class Tokens {
+		public String sessionId;
+		public String api;
+		public String license;
+		public Instant expireAt;
+
+		public Tokens(String sessionId, String api, String license, Instant expireAt) {
+			this.sessionId = sessionId;
+			this.api = api;
+			this.license = license;
+			this.expireAt = expireAt;
+		}
+	}
 }
